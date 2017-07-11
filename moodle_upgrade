@@ -1,0 +1,691 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Moodle upgrader.
+ *
+ * PHP version 5
+ *
+ * @author    Jonathan Robson <jonathan.robson@remote-learner.net>
+ * @copyright 2010-2015 Remote-Learner, Inc.
+ * @license   http://www.gnu.org/licenses/gpl-3.0.txt GNU GPLv3
+ * @link      http://git.remote-learner.net/private.cgi?p=rlscripts.git
+ */
+require_once(dirname(__FILE__).'/../lib/config-2.php');
+require_once($_RLSCRIPTS->lib.'/moodlelib.php');
+require_once($_RLSCRIPTS->lib.'/fslib.php');
+require_once($_RLSCRIPTS->lib.'/menuitem.php');
+require_once($_RLSCRIPTS->lib.'/webserviceslib.php');
+require_once($_RLSCRIPTS->lib.'/upgrade_lib.php');
+
+/**
+ * Upgrade Manager
+ *
+ * This class works around the hard-coded branch reload in the menu class
+ */
+class upgrade_manager extends RLSCRIPTS_Moodle_Manager {
+
+    /** @var array An array of plugin types */
+    protected $plugintypes = null;
+    /**
+     * Get a list of repository branches.
+     *
+     * Fake the Moodle 2.6 branches for elisfiles and elis to make the upgrade process smoother.
+     *
+     * @param string $repository The repository to get branches for, or blank for all repositories
+     * @param string $minimum    The minimum version to consider
+     * @return array An array of branches or an array of arrays of branches
+     */
+    public function get_branches($repository = '', $minimum = 0) {
+        $branches = parent::get_branches($repository, $min);
+
+        // Work around for upgrade to ELIS/ELIS Files 2.6 (Really GAO with ELIS/ELIS Files plugins enabled).
+        if ($min < 26) {
+            $branches['rlmoodle.elis.git'][] = 'MOODLE_26_STABLE';
+            $branches['rlmoodle.elisfiles.git'][] = 'MOODLE_26_STABLE';
+        }
+        return $branches;
+    }
+}
+
+echo "\n".'RL SCRIPTS MOODLE UPGRADER'."\n\n";
+
+$options = get_options(
+    array(
+        'test-dir|t:NAME=moodletest' => array(
+            'summary' => 'The name of the sub-directory for the test upgrade site.',
+        ),
+        'include-backupdata' => array(
+            'summary' => 'Include course backups in test upgrade site (not included by default).',
+        ),
+        'dry-run' => array(
+            'summary' => 'Don\'t actually run the upgrade but simply check for potential issues '.
+                         'like conflicting directories/databases or disk space.',
+        ),
+        'exclude-dataroot' => array(
+            'summary' => 'Don\'t copy the contents of the data directory for the test upgrade '.
+                         'site. WARNING: Might have unexpected side effects such as missing missing '.
+                         'content, incorrect language strings, and possibly more.',
+        ),
+        'skip-refresh' => array(
+            'summary' => 'Skip the sandbox refresh.',
+        ),
+        'skip-sizecheck' => array(
+            'summary' => 'Skip the size checks performed on the files and database.',
+        )
+    ),
+    $argv[0].' [OPTIONS...] PATH_TO_MOODLE'
+);
+
+$path = end($argv);
+
+$manager = new upgrade_manager(null, $_CLI);
+
+if (!is_dir($path)) {
+    $manager->error('The path you gave either isn\'t a directory or doesn\'t exist.');
+} else if (!is_moodle($path)) {
+    $manager->error('Moodle does not appear to be installed in the path you gave.');
+}
+
+$path = realpath($path);
+
+$options['test-dir'] = trim($options['test-dir'], '/ ');
+
+if (!preg_match('/^[\w\-\.]{3,}$/', $options['test-dir'])) {
+    $manager->error('Invalid directory name given for the Moodle test upgrade site.');
+}
+
+RLSCRIPTS_Git::verify_keys();
+
+$manager->load_config($path);
+unset($path);
+
+$config = array();
+$config['prod'] = $manager->get_config();
+
+// Don't log dry-runs.
+if (!$options['dry-run']) {
+    $manager->set_log_file('rlscripts-upgrade-'. date('Y-m-d-His') .'.log');
+}
+
+$manager->status('Testing connecting to MySQL (Root)');
+
+$db = new db_mysql();
+$db->set_database($config['prod']->dbname);
+if (empty($config['prod']->dbhost)) {
+    $config['prod']->dbhost = 'localhost';
+}
+$db->set_host($config['prod']->dbhost);
+if (($mysqlroot = $db->connect()) === false) {
+    $manager->error('Unable to login to MySQL on host "'.$config['prod']->dbhost.'" as root.');
+}
+
+$manager->success();
+
+$manager->status('Testing connecting to MySQL ('.$config['prod']->dbuser.')');
+
+$conn = new db_mysql($config['prod']);
+if ($conn->connect() === false) {
+    $manager->error('Unable to connect to MySQL as Moodle user');
+}
+$manager->success();
+
+// Moodle 1.9 sites may not be under a git repo. This script requires the site to be converted into a git repo before upgrade.
+if (!is_dir($config['prod']->dirroot.'/.git')) {
+    $answer = cli_prompt('This site does not appear to be under a git repository. It must be converted into a git repository before ' .
+                         'you can proceed with the upgrade. Would you like to proceed with the conversion to git? (y/n)?', 'no', '/^[yn]/');
+
+    if (strtolower($answer[0]) != 'y') {
+        $manager->message('Git conversion aborted.');
+        exit(0);
+    }
+
+    $result = $manager->upgrade_to_git('/tmp/tmpmoodleupgrade', 'ssh://git@git.remote-learner.net/rlmoodle.plain.git');
+
+    if ($result) {
+        $manager->message('Git conversion completed.');
+        exit(0);
+    }
+}
+
+$status = $manager->check_git_status();
+if ($status === false) {
+    $this->error('Failed checking git status');
+}
+
+$manager->message("Git repository:    {$status['repository']}");
+$manager->message("Git branch:        {$status['branch']}");
+if (!$options['skip-sizecheck']) {
+    $excludes = array();
+    $sizes = array();
+    $sizes['dir'] = $manager->directory_size($config['prod']->dirroot, $excludes);
+    $manager->message('Web directory:     '.human_bytes($sizes['dir']));
+    if (!$options['exclude-dataroot']) {
+        if ($options['include-backupdata'] === false) {
+            $excludes = array('^\d+\/backupdata');
+        }
+        $sizes['data'] = $manager->directory_size($config['prod']->dataroot, $excludes);
+        $manager->message('Data directory:    '.human_bytes($sizes['data']));
+    }
+    $sizes['db'] = $manager->database_size();
+    $manager->message('Database:          '.human_bytes($sizes['db']));
+} else {
+    $manager->message("Skipping the size calculations.");
+}
+
+// Used to check whether we will *only* upgrade the sandbox site.
+$upgradesandbox = false;
+$upgrade = false;
+$issimplecfg = false;
+$osrelease = os_release();
+
+// Use the new project "Simple" config file format if config_prep exists.
+if (file_exists('/etc/php.d/config_prep.php')) {
+    $issimplecfg = true;
+}
+
+$testdir = $config['prod']->dirroot.'/'.$options['test-dir'];
+if ($issimplecfg) {
+    $testdir = str_replace('moodle_prod', 'moodle_sand', $config['prod']->dirroot);
+}
+
+if (is_dir($testdir)) {
+
+    if ($manager->is_moodle($testdir)) {
+        $manager->message("Test site created: yes\n");
+
+        $test = new upgrade_manager(null, $_CLI);
+
+        $manager->message("Loading test site configuration.");
+        if ($test->load_config($testdir)) {
+            // Set flag that indicates we are updating the sandbox by default.
+            $upgradesandbox = true;
+
+            $teststatus = $test->check_git_status();
+            if ($teststatus === false) {
+                $this->error('Failed checking git status');
+            }
+
+            $manager->message("\nTest repository:   {$teststatus['repository']}");
+            $manager->message("Test branch:       {$teststatus['branch']}");
+
+            $config['sand'] = $test->get_config();
+
+            if ($config['sand']->version < $config['prod']->version) {
+                $error  = "The version of the Moodle site installed in '{$testdir}' is OLDER than the site you want to upgrade.";
+                $manager->warning($error);
+
+            } else {
+                if ($config['sand']->version == $config['prod']->version) {
+                    $manager->warning('There is an existing test upgrade site with the SAME version of Moodle.');
+                } else {
+                    $manager->message('There is an existing test upgrade site with a newer version of Moodle.');
+                }
+
+                $answer = cli_prompt('Do you want to upgrade the main site from the test site (y/n)?', 'no', '/^[yn]/');
+
+                if (strtolower(substr($answer, 0, 1)) == 'y') {
+                    $upgrade = true;
+                    // Turn off sandbox upgrade flag because we don't need to do that in this case.
+                    $upgradesandbox = false;
+                }
+            }
+        } else {
+            $manager->warning('Moodle appears to be installed in "'.$testdir.
+                              '", but there was a problem reading the config.php file there.');
+        }
+    } else {
+        $manager->warning('The test directory ('.$testdir.') exists but Moodle does not appear to be installed in it');
+    }
+}
+
+$target = 'sand';
+if ($upgrade) {
+    $target = 'prod';
+} else if (!$upgradesandbox) {
+    // These commands only get run if we are creating a new sandbox site.
+    $config['sand'] = clone $config['prod'];
+    $config['sand']->rlscripts_git_repo = $status['repository'];
+    $config['sand']->rlscripts_git_branch = $status['branch'];
+    $config['sand']->dirroot = $testdir;
+    $config['sand']->dataroot = str_replace('moodledata_prod', 'moodledata_sand', $config['prod']->dataroot);
+    $config['sand']->dbname = str_replace('moodle_prod', 'moodle_sand', $config['prod']->dbname);
+    $config['sand']->rlscripts_git_branch = $status['branch'];
+} else if ($options['skip-refresh']) {
+    // We need to use the test site status if we are upgrading the sandbox and not refreshing the site first.
+    $status = $teststatus;
+}
+
+// Figure out the OS before initializing the default configuration paths
+$os = 'redhat';
+$basedir = '/opt/rlcache/www';
+$extenddir = "/opt/rlcache/moodledata_{$target}";
+if ($osrelease->centos) {
+    $os = 'centos'.$osrelease->major_version;
+    $basedir = '/mnt/code/www';
+    if ($osrelease->major_version == 6) {
+        $extenddir = "/mnt/scratch/moodledata_{$target}";
+    } else if ($osrelease->major_version >= 7) {
+        $extenddir = "/mnt/code/scratch/moodledata_{$target}";
+    }
+}
+
+$config[$target]->datarootextended = '';
+$config[$target]->cachedir = '';
+$config[$target]->sessiondir = '';
+$config[$target]->localcachedir = '';
+$config[$target]->lockdir = '';
+$config[$target]->mucdir = '';
+if ($issimplecfg) {
+    $config[$target]->datarootextended = $extenddir;
+    $config[$target]->cachedir = $config[$target]->datarootextended.'/cache';
+    $config[$target]->sessiondir = $config[$target]->datarootextended.'/sessions';
+    $config[$target]->localcachedir = $config[$target]->datarootextended.'/localcache';
+    $config[$target]->lockdir = $config[$target]->datarootextended.'/lock';
+    $config[$target]->mucdir = $config[$target]->datarootextended.'/muc';
+}
+
+if (!$upgrade) {
+    if ($issimplecfg) {
+        if (substr($config['sand']->wwwroot, -8) != '/sandbox') {
+            $config['sand']->wwwroot .= '/sandbox';
+        }
+
+    } else {
+        $config['sand']->wwwroot  .= '/'.$options['test-dir'];
+        $config['sand']->dbname   .= '_'.$options['test-dir'];
+        $config['sand']->dirroot  .= '/'.$options['test-dir'];
+        $config['sand']->dataroot .= '_'.$options['test-dir'];
+    }
+
+    $manager->status('Checking GAO Capability');
+    $result = $manager->check_for_gao_upgrade();
+    $manager->success();
+    if (true === $result) {
+        $answer = $manager->prompt('This site is eligible for upgrade to GAO, do so?', '/^[yn]/', 'no');
+
+        if (strtolower(substr($answer, 0, 1)) == 'y') {
+            if ($config['sand']->rlscripts_git_repo == 'rlmoodle.elis.git') {
+                if ($config['sand']->rlscripts_git_branch == 'MOODLE_19_STABLE') {
+                    $config['sand']->rlscripts_git_branch = 'MOODLE_21_STABLE';
+                }
+
+            } else if ($config['sand']->rlscripts_git_repo == 'rlmoodle.plain.git') {
+                $config['sand']->rlscripts_git_repo = 'rlmoodle.gao.git';
+
+                if ($config['sand']->rlscripts_git_branch == 'MOODLE_19_STABLE') {
+                    $config['sand']->rlscripts_git_branch = 'MOODLE_20_STABLE';
+                }
+            }
+
+        }
+    } else if (!$manager->is_gao()) {
+        $manager->warning("This site can not be automatically upgraded to GAO:\n". $result);
+    }
+
+    $dbname_item = new menuitem_db('2', 'MySQL database name:', $config['sand']->dbhost);
+    if ($upgradesandbox) {
+        $dbname_item->set_allow_db(true);
+        $manager->status('Checking if database exists');
+    } else {
+        $manager->status('Checking for conflicting databases');
+    }
+
+    if (!$dbname_item->set_value($config['sand']->dbname)) {
+        $manager->failure();
+        $dbname_item->prompt();
+    } else {
+        $manager->success();
+    }
+
+    $dirroot_item = new menuitem_dir('6', 'Web directory:');
+    $dataroot_item = new menuitem_dir('7', 'Data directory:');
+    if ($upgradesandbox) {
+        $manager->status('Checking if directories exist');
+        $dirroot_item->set_allow_non_empty_dir(true);
+        $dataroot_item->set_allow_non_empty_dir(true);
+    } else {
+        $manager->status('Checking for conflicting directories');
+    }
+
+    if (!$dirroot_item->set_value($config['sand']->dirroot)) {
+        $manager->failure();
+        $dirroot_item->prompt();
+    }
+
+    if (! $dataroot_item->set_value($config['sand']->dataroot)) {
+        $manager->failure();
+        $dataroot_item->prompt();
+    }
+
+    $manager->success();
+
+    $msg = 'Preparing to create the sandbox site.';
+    if ($upgradesandbox) {
+        $msg = 'Preparing to upgrade the sandbox site.';
+    }
+    $intro = "\n$msg Choose your site settings below:\n";
+
+    $min     = 0;
+    $matches = array();
+
+    if (preg_match('/MOODLE_(\d+)_STABLE/', $config['sand']->rlscripts_git_branch, $matches)) {
+        $min = $matches[1];
+    } else {
+        $manager->warning('Unable to determine main Moodle site version from branch name: '.$config['sand']->rlscripts_git_branch);
+    }
+
+    $branches    = $manager->get_branches('', $min);
+    $repo_item   = new menuitem_regex('13', 'Git repository:', '/^rlmoodle\.[\w\.]+\.git$/', $config['sand']->rlscripts_git_repo);
+    $branch_item = new menuitem_list_dependent('14', 'Type the number of the branch you\'d like to use:',
+                                               $branches, $config['sand']->rlscripts_git_repo, $config['sand']->rlscripts_git_branch, 'Git repository branch');
+
+    if (empty($config['sand']->dbhost)) {
+        $config['sand']->dbhost = 'localhost';
+    }
+
+    $items = array(
+        'dbhost'               => new menuitem_ip('1', 'MySQL server:', $config['sand']->dbhost),
+        'dbname'               => $dbname_item,
+        'dbuser'               => new menuitem_regex('3', 'MySQL user:', '/^\w{4,16}$/i', $config['sand']->dbuser),
+        'dbpass'               => new menuitem('4', 'MySQL password:', $config['sand']->dbpass),
+        'wwwroot'              => new menuitem_url('5', 'Full URL of the Moodle site:', $config['sand']->wwwroot, 'Full URL:'),
+        'dirroot'              => $dirroot_item,
+        'dataroot'             => $dataroot_item,
+        'cachedir'             => new menuitem('8', 'Cache directory:', $config['sand']->cachedir),
+        'sessiondir'           => new menuitem('9', 'Session directory:', $config['sand']->sessiondir),
+        'mucdir'               => new menuitem('10', 'Muc directory:', $config['sand']->mucdir),
+        'lockdir'              => new menuitem('11', 'Lock directory:', $config['sand']->lockdir),
+        'localcachedir'        => new menuitem('12', 'Local cache directory:', $config['sand']->localcachedir),
+        'rlscripts_git_repo'   => $repo_item,
+        'rlscripts_git_branch' => $branch_item,
+    );
+
+    $menu = new menu($_CLI, $items, $intro, '', $manager);
+    $menu->add_dependency('rlscripts_git_repo', 'rlscripts_git_branch');
+    $menu->add_dependency('dbhost', 'dbname');
+
+    // Callback option generator for branches when dbhost changes
+    $generator = function($value) use ($config) {
+        $config['sand']->dbhost = $value;
+        $manager = new upgrade_manager($config['sand']);
+        return $manager->get_branches();
+    };
+    $menu->add_dependency('dbhost', 'rlscripts_git_branch', $generator);
+
+    $menu->run();
+    $values = $menu->get_values();
+
+    $settings = array(
+        'dataroot', 'dbhost', 'dbname',  'dbpass', 'dbuser',  'dirroot',
+        'rlscripts_git_branch', 'rlscripts_git_repo', 'wwwroot',
+    );
+
+    foreach ($settings as $value) {
+        $config['sand']->$value = $values[$value];
+    }
+}
+
+// Check for ELIS and ELIS files and set the proper repository
+// Get the integer portion of the branch
+$brancharray = explode('_', $config['sand']->rlscripts_git_branch);
+$branchversion = $brancharray[1];
+$iselis = ($status['repository'] == 'rlmoodle.elis.git' || $status['repository'] == 'rlmoodle.elisfiles.git');
+$elistogao = false;
+
+if ($iselis && ($branchversion >= '26')) {
+    $config['sand']->rlscripts_git_repo = 'rlmoodle.gao.git';
+    $elistogao = true;
+    $manager->warning('ELIS will be converted to new plugins architecture.');
+}
+
+$major = $manager->check_for_major_upgrade($status['branch']);
+if ($major) {
+    if (!$manager->confirm_major_upgrade($status['branch'])) {
+        $manager->message("Major upgrade aborted.");
+        exit;
+    }
+}
+
+if ($options['dry-run']) {
+    $manager->message("Dry run completed.");
+    exit;
+}
+
+// Upgrade production site.
+if ($upgrade) {
+
+    $moodlerelease = 'Unavailable';
+    if (!empty($config['sand']->release)) {
+        $moodlerelease = $config['sand']->release;
+    }
+    $elisrelease = 'Unavailable';
+    if (!empty($config['sand']->rlscripts_elis_release)) {
+        $elisrelease = $config['sand']->rlscripts_elis_release;
+    }
+
+    // Put the site in maintenance mode.
+    $manager->block('maintenance');
+
+    $backupdir = $manager->get_backupdir();
+
+    $manager->status("Backing up web directory: copying from '{$config['prod']->dirroot}' to '$backupdir'");
+    $manager->shallow_copy($config['prod']->dirroot, $backupdir);
+
+    $manager->success();
+
+    $manager->backup_mysql($backupdir.'/moodle_prod.sql.gz');
+
+    // Calculate the size of the backup.
+    $size = $manager->directory_size($testdir);
+    $manager->status('Calculated size of test upgrade site ('.human_bytes($size).')', true);
+    $manager->success();
+
+    // Cleanup the code.
+    $manager->status('Cleaning up the Git repository');
+    $_SHELL->exec($_RLSCRIPTS->root.'/automation/moodle/moodle_clean "'.$config['prod']->dirroot.'"');
+    $manager->success();
+
+    $settings = array('disableupdatenotifications' => '$CFG->disableupdatenotifications = true;');
+
+    // Include themedir setting only for non M1.9 sites.
+    if ($config['sand']->rlscripts_git_branch != 'MOODLE_19_STABLE') {
+        $settings['themedir'] = '$CFG->themedir = $CFG->dataroot.\'/'.MOODLE_THEME_DIR.'\';';
+    }
+
+    $manager->status('Updating config file');
+    $manager->update_config_file($settings, true);
+
+    // Fixup the dataroot (if necessary)
+    $manager->create_dataroot();
+
+    // Set commit id of sandbox
+    if (!$manager->set_commit_id($config['sand']->dirroot, 'sand')) {
+        $manager->error('Unable to get commit id of '.$config['sand']->dirroot);
+    }
+
+    // Set commit id of sandbox
+    if (!$manager->set_commit_id($config['prod']->dirroot, 'prod')) {
+        $manager->error('Unable to get commit id of '.$config['prod']->dirroot);
+    }
+
+    $prodcommitid = $manager->get_commit_id('prod');
+    $sandcommitid = $manager->get_commit_id('sand');
+
+    $action = 'updated';
+    if ((($config['sand']->rlscripts_git_branch) == ($config['prod']->rlscripts_git_branch)) &&
+            (!$manager->check_if_ancestor($config['prod']->dirroot, $config['sand']->dirroot))) {
+        // Abort immediately, if production is newer than sandbox.
+        $manager->error('Upgrade has failed, production is newer than sandbox');
+    } else if ($prodcommitid == $sandcommitid) {
+        $manager->warning('The production site is using the same Moodle code as the sandbox.');
+        $manager->update($config['sand']->dirroot);
+    } else {
+        // Copy the test upgrade code from the backup (exclude config.php).
+        $manager->status('Upgrading main site');
+        // We use the sandbox config here because we are upgrading to the sandbox version.
+        if (($config['sand']->rlscripts_git_branch != $status['branch']) || ($config['sand']->rlscripts_git_repo != $status['repository'])) {
+            $action = 'upgraded';
+            $manager->upgrade($config['sand']->rlscripts_git_branch, $config['sand']->rlscripts_git_repo, $config['sand']->dirroot);
+        } else {
+            $manager->update($config['sand']->dirroot);
+        }
+
+        // Cleanup the code.
+        $manager->status('Cleaning up the Git repository');
+        $_SHELL->exec($_RLSCRIPTS->root.'/automation/moodle/moodle_clean "'.$config['prod']->dirroot.'"');
+        $manager->success();
+    }
+
+    // The plugin enabling must be done after the $manager->upgrade call or it will block the upgrade.
+    // If this an elis or an elis files based site for Moodle version > 2.6, enable the elis/elisfiles group of GAO+ plugins
+    // The actual repository should already be on GAO, so we need to use the cached value set by moodle_tag
+    if ($elistogao) {
+        $manager->convert_elis_to_plugins($config['prod']->rlscripts_git_repo);
+
+        // Run the database upgrade script again to install elis plugins.
+        $manager->run_upgrade_script();
+    }
+
+    // Fix permissions.
+    $manager->message('Fixing file permissions (minimal):');
+    $manager->fix_permissions_minimal();
+
+    // Take the site out of maintenance mode.
+    $manager->unblock();
+    $manager->success();
+
+    // Check the database for errors.
+    $manager->validate_db();
+
+    // Attempt to load the configuration file (to validate it).
+    if (!$manager->load_config($config['prod']->dirroot)) {
+        $manager->error('Unable to get configuration settings');
+    }
+
+    // Send config data to the Dashboard.
+    system($_RLSCRIPTS->root.'/automation/moodle/moodle_send_config_data');
+
+    // Notify the Dashboard that an upgrade has been completed.
+    $manager->history('upgrade', "Moodle site successfully {$action}.");
+
+    $message = "You're almost done! Please login to the Moodle site to test the upgrade:";
+    $manager->message("\n$message\n\n    {$config['prod']->wwwroot}\n\n");
+    $manager->write_log();
+    exit(0);
+}
+
+// If we've gotten this far, create a test upgrade site.
+if ($options['exclude-dataroot']) {
+    $message = 'WARNING: Using the `--exclude-dataroot` option can have unexpected side effects such as '.
+               'missing content, incorrect language strings, and possibly more.';
+    $manager->message("\n".CLI::formatText($message)."\n");
+    $answer = $manager->prompt('Are you sure you want to continue (y/n)?', '/^[yn]/i', 'n');
+
+    if (strtolower($answer[0]) != 'y') {
+        exit(0);
+    }
+
+    echo "\n";
+}
+
+if (!$options['skip-refresh']) {
+    try {
+        $refresh = new RLSCRIPTS_Moodle_SiteRefresh($config['sand']->dirroot, $email);
+    } catch (Exception $e) {
+        $manager->error('An exception ocurred during initialization of refresh system: '.$e->getMessage()."\n\n");
+    }
+
+    $refresh->execute_migrate_code();
+    $refresh->execute_migrate_db();
+
+    if (!$options['exclude-dataroot']) {
+        $refresh->execute_migrate_data();
+        $refresh->write_timestamp_file();
+
+    } else if (!$upgradesandbox) {
+        $manager->status('Creating empty data directory');
+
+        if (mkdir($config['sand']->dataroot, 0770, true) === false) {
+            $manager->error('Failed to create directory "'.$config['sand']->dataroot.'"');
+        }
+
+        chown($config['sand']->dataroot, $apache);
+        chgrp($config['sand']->dataroot, $owner);
+
+        $manager->success();
+    }
+} else {
+    $manager->message("Skipping the sandbox refresh.");
+}
+
+// Everything's copied. Get rid of this to free memory.
+unset($config['prod']);
+
+$manager->set_config($config['sand']);
+$manager->reset_git();
+$trackingresult = $manager->disable_filemode_tracking();
+if ($trackingresult === false) {
+    $this->warning('Failed disabling filemode tracking');
+}
+
+$manager->create_dataroot();
+
+$manager->generate_config_file(true);
+// Permissions must be fixed before the Manager's upgrade function is called or the database upgrade script will fail.
+
+$manager->fix_permissions();
+
+if (($config['sand']->rlscripts_git_branch != $status['branch']) || ($config['sand']->rlscripts_git_repo != $status['repository'])) {
+    $manager->upgrade($config['sand']->rlscripts_git_branch, $config['sand']->rlscripts_git_repo);
+} else {
+    $manager->update();
+}
+
+// The plugin enabling must be done after the $manager->upgrade call or it will block the upgrade.
+// If this an elis or an elis files based site for Moodle version > 2.6, enable the elis/elisfiles group of GAO+ plugins
+// The actual repository should already be on GAO, so we need to use the cached value set by moodle_tag
+if ($elistogao) {
+    $manager->convert_elis_to_plugins($status['repository']);
+
+    // Run the database upgrade script again to install elis plugins.
+    $manager->run_upgrade_script();
+}
+
+$db = new db_mysql($config['sand']);
+if (($mysqlmoodle = $db->connect()) === false) {
+    $manager->error('Unable to connect to database with test site credentials');
+}
+
+$manager->fix_permissions();
+
+$manager->status('Finishing up');
+
+if (!update_session_cookie($mysqlmoodle, $config['sand']->prefix)) {
+    $manager->error('Failed updating session cookie');
+}
+
+if (!disable_user_email($mysqlmoodle, $config['sand']->prefix)) {
+    $manager->error('Failed disabling email for users');
+}
+
+if (!delete_rlip_paths($mysqlmoodle, $config['sand']->prefix)) {
+    $manager->error('Failed delete RLIP paths');
+}
+
+@rmdir('/mnt/data/tmp');
+
+$manager->success();
+
+$manager->validate_db();
+
+if (!$manager->load_config($config['sand']->dirroot)) {
+    $manager->error('Unable to get configuration settings');
+}
+
+system($_RLSCRIPTS->root.'/automation/moodle/moodle_send_config_data');
+
+$manager->history('upgrade', 'Moodle test site successfully upgraded');
+
+$message = 'You\'re almost done! Please login to the Moodle test site to test the upgrade:';
+$manager->message("\n$message\n\n    {$config['sand']->wwwroot}\n\n");
+$manager->write_log();
